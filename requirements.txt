@@ -1,10 +1,14 @@
 torch==2.2.2
-torchvision==0.18.2
+torchvision==0.17.2
 torchaudio==2.2.2
 diffusers==0.27.2
 transformers==4.39.3
 huggingface_hub==0.23.0
 accelerate==0.22.0
-numpy==1.26.0
-ipython==8.16.2
+numpy==1.26.4
+ipython==8.17.2
 pillow==10.0.0
+opencv-python==4.10.0.84
+tqdm==4.67.1
+matplotlib==3.8.4
+sympy==1.12.1
