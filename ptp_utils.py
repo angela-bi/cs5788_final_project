@@ -14,12 +14,44 @@
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import cv2
 from typing import Optional, Union, Tuple, List, Callable, Dict
 from IPython.display import display
 # `tqdm.notebook` requires ipywidgets; `tqdm.auto` works in both notebooks and scripts.
 from tqdm.auto import tqdm
+
+
+def _preprocess_pil_to_sd_tensor(
+    image: Union[Image.Image, np.ndarray],
+    size: Optional[Tuple[int, int]],
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    fit: str = "pad",
+) -> torch.Tensor:
+    """Convert an RGB image into a diffusers-compatible tensor in [-1, 1]."""
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image.astype(np.uint8))
+    if not isinstance(image, Image.Image):
+        raise TypeError(f"`image` must be a PIL.Image or np.ndarray, got {type(image)}")
+    # Respect camera EXIF orientation (common for phone photos).
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    if size is not None:
+        if fit not in ("pad", "crop", "resize"):
+            raise ValueError(f"`fit` must be one of ('pad','crop','resize'), got {fit}")
+        if fit == "pad":
+            # Preserve full content; add borders as needed.
+            image = ImageOps.pad(image, size, method=Image.BICUBIC, color=(0, 0, 0), centering=(0.5, 0.5))
+        elif fit == "crop":
+            # Preserve aspect ratio; center-crop to target size.
+            image = ImageOps.fit(image, size, method=Image.BICUBIC, centering=(0.5, 0.5))
+        else:
+            # Potentially distorts; kept for backwards-compat/debug.
+            image = image.resize(size, resample=Image.BICUBIC)
+    image_np = np.array(image).astype(np.float32) / 255.0
+    image_t = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+    image_t = image_t.to(device=device, dtype=dtype)
+    return image_t * 2.0 - 1.0
 
 
 def text_under_image(image: np.ndarray, text: str, text_color: Tuple[int, int, int] = (0, 0, 0)):
@@ -63,11 +95,20 @@ def view_images(images, num_rows=1, offset_ratio=0.02):
 
 
 def diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource=False):
+    # Many schedulers expect model inputs to be scaled per-timestep.
+    # (e.g. Karras / Euler / some multistep schedulers in diffusers)
+    def _scale(x):
+        if hasattr(model, "scheduler") and hasattr(model.scheduler, "scale_model_input"):
+            return model.scheduler.scale_model_input(x, t)
+        return x
+
     if low_resource:
-        noise_pred_uncond = model.unet(latents, t, encoder_hidden_states=context[0])["sample"]
-        noise_prediction_text = model.unet(latents, t, encoder_hidden_states=context[1])["sample"]
+        latents_scaled = _scale(latents)
+        noise_pred_uncond = model.unet(latents_scaled, t, encoder_hidden_states=context[0])["sample"]
+        noise_prediction_text = model.unet(latents_scaled, t, encoder_hidden_states=context[1])["sample"]
     else:
         latents_input = torch.cat([latents] * 2)
+        latents_input = _scale(latents_input)
         noise_pred = model.unet(latents_input, t, encoder_hidden_states=context)["sample"]
         noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
     noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
@@ -161,14 +202,116 @@ def text2image_ldm_stable(
     latent, latents = init_latent(latent, model, height, width, generator, batch_size)
     
     # set timesteps
-    extra_set_kwargs = {"offset": 1}
-    model.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
+    # Scheduler API varies across diffusers schedulers (some accept `offset`, some don't).
+    try:
+        model.scheduler.set_timesteps(num_inference_steps, offset=1)
+    except TypeError:
+        model.scheduler.set_timesteps(num_inference_steps)
     for t in tqdm(model.scheduler.timesteps):
         latents = diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource)
     
     image = latent2image(model.vae, latents)
   
     return image, latent
+
+
+@torch.no_grad()
+def image2image_ldm_stable(
+    model,
+    prompt: List[str],
+    controller,
+    init_image: Union[Image.Image, np.ndarray],
+    strength: float = 0.65,
+    negative_prompt: Optional[List[str]] = None,
+    num_inference_steps: int = 50,
+    guidance_scale: float = 7.5,
+    generator: Optional[torch.Generator] = None,
+    low_resource: bool = False,
+    size: Optional[Tuple[int, int]] = None,
+    fit: str = "pad",
+    max_side: Optional[int] = 512,
+):
+    """
+    Stylized editing for a real image using an SD-like pipeline.
+
+    This follows the standard img2img recipe:
+    - encode init_image to VAE latents
+    - add noise at a timestep determined by `strength`
+    - denoise while applying Prompt-to-Prompt attention control
+    """
+    if not (0.0 < strength <= 1.0):
+        raise ValueError(f"`strength` must be in (0, 1], got {strength}")
+
+    register_attention_control(model, controller)
+    batch_size = len(prompt)
+
+    # Text conditioning
+    text_input = model.tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=model.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_embeddings = model.text_encoder(text_input.input_ids.to(model.device))[0]
+    max_length = text_input.input_ids.shape[-1]
+    if negative_prompt is None:
+        negative_prompt = [""] * batch_size
+    if len(negative_prompt) != batch_size:
+        raise ValueError(f"`negative_prompt` must have same length as `prompt` ({batch_size})")
+    uncond_input = model.tokenizer(
+        negative_prompt, padding="max_length", max_length=max_length, return_tensors="pt"
+    )
+    uncond_embeddings = model.text_encoder(uncond_input.input_ids.to(model.device))[0]
+
+    context = [uncond_embeddings, text_embeddings]
+    if not low_resource:
+        context = torch.cat(context)
+
+    # Image -> latent
+    # If no explicit size is provided, preserve aspect ratio and cap resolution to control memory.
+    if size is None:
+        if isinstance(init_image, np.ndarray):
+            h0, w0 = init_image.shape[:2]
+        else:
+            w0, h0 = init_image.size
+        if max_side is not None and max(w0, h0) > max_side:
+            scale = max_side / float(max(w0, h0))
+            w0 = int(round(w0 * scale))
+            h0 = int(round(h0 * scale))
+        w = max((w0 // 8) * 8, 64)
+        h = max((h0 // 8) * 8, 64)
+        size = (w, h)
+        # When we compute size from aspect ratio, a plain resize preserves aspect without distortion.
+        # Padding is still available when an explicit target size is passed in.
+        fit = "resize"
+    image_t = _preprocess_pil_to_sd_tensor(
+        init_image, size=size, device=model.device, dtype=text_embeddings.dtype, fit=fit
+    )
+    init_latents = model.vae.encode(image_t).latent_dist.sample(generator=generator)
+    init_latents = 0.18215 * init_latents
+    init_latents = init_latents.expand(batch_size, -1, -1, -1).contiguous()
+
+    # Scheduler timesteps + add noise according to strength
+    # Scheduler API varies across diffusers schedulers (some accept `offset`, some don't).
+    try:
+        model.scheduler.set_timesteps(num_inference_steps, offset=1)
+    except TypeError:
+        model.scheduler.set_timesteps(num_inference_steps)
+    timesteps = model.scheduler.timesteps
+
+    init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+    t_start = max(num_inference_steps - init_timestep, 0)
+    noise_timestep = timesteps[t_start]
+
+    noise = torch.randn(init_latents.shape, generator=generator, device=init_latents.device, dtype=init_latents.dtype)
+    latents = model.scheduler.add_noise(init_latents, noise, noise_timestep)
+
+    for t in tqdm(timesteps[t_start:]):
+        latents = diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource)
+
+    image = latent2image(model.vae, latents)
+    return image, latents
 
 
 def register_attention_control(model, controller):
