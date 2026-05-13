@@ -159,10 +159,12 @@ def text2image_ldm_stable(
     if not low_resource:
         context = torch.cat(context)
     latent, latents = init_latent(latent, model, height, width, generator, batch_size)
-    
-    # set timesteps
-    extra_set_kwargs = {"offset": 1}
-    model.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
+
+    # Older diffusers builds accepted offset=1 for SD1.x DDIM parity; current DDIMScheduler does not.
+    try:
+        model.scheduler.set_timesteps(num_inference_steps, offset=1)
+    except TypeError:
+        model.scheduler.set_timesteps(num_inference_steps)
     for t in tqdm(model.scheduler.timesteps):
         latents = diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource)
     
