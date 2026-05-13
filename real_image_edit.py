@@ -211,6 +211,8 @@ def edit_real_image(
         "reconstruction": edited_images[0],
         "edited": edited_images[1],
         "latents": all_latents,
+        "source_prompt": source_prompt,
+        "target_prompt": target_prompt,
     }
 
 
@@ -445,6 +447,8 @@ def edit_real_image_null(
         "reconstruction": image_rec,
         "edited": edited_images[1],
         "latents": all_latents,
+        "source_prompt": source_prompt,
+        "target_prompt": target_prompt,
     }
 
 
