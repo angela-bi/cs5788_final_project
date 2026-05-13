@@ -12,5 +12,6 @@ pillow>=10.0.0
 opencv-python>=4.10.0.84
 tqdm>=4.67.1
 matplotlib>=3.8.4
-sympy>=1.12.1
+# PyTorch 2.9 + diffusers expect a stable sympy API; 1.14+ can break `from sympy import S` at import time.
+sympy>=1.12.1,<1.13
 nbconvert>=7.11.0
