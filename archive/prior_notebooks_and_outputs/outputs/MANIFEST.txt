@@ -1,0 +1,9 @@
+# Expected filenames if you restore from backup
+out_cat.png
+out_cat_v2.png
+out_cat_v3.png
+out_cat_controlnet.png
+out_cat_controlnetv2.png
+out_cat_controlnetv3.png
+out_cat_watercolor.png
+out_dog_v3.png
